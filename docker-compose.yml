@@ -1,0 +1,14 @@
+services:
+  sherlock-web:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - sherlock-results:/app/data
+    environment:
+      # For LAN/internet access set a long secret SHERLOCK_WEB_TOKEN in your environment.
+      SHERLOCK_WEB_TOKEN: ${SHERLOCK_WEB_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  sherlock-results:
