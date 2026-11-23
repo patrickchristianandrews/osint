@@ -74,14 +74,51 @@ def engine_version() -> str | None:
         return None
 
 
-def discover_sites() -> list[str]:
-    """Show precisely the bundled upstream catalog, without maintaining a false local list."""
+CATALOG_CACHE_TTL = 600
+CATALOG_CACHE: dict = {}
+CATALOG_LOCK = threading.RLock()
+
+def get_catalog() -> dict:
+    """Follow Sherlock's current live catalog, not just the bundled snapshot."""
+    now = time.monotonic()
+    with CATALOG_LOCK:
+        if CATALOG_CACHE and now - CATALOG_CACHE["fetched_at"] < CATALOG_CACHE_TTL:
+            return CATALOG_CACHE
+    # The upstream CLI uses these same two data sources.
+    from importlib.resources import files
+    bundled = json.loads(files("sherlock_project").joinpath("resources", "data.json").read_text(encoding="utf-8"))
+    entries = {k: v for k, v in bundled.items() if not k.startswith("$") and isinstance(v, dict)}
+    source = "bundled fallback"
     try:
-        from importlib.resources import files
-        data = json.loads(files("sherlock_project").joinpath("resources", "data.json").read_text(encoding="utf-8"))
-        return sorted(key for key in data if not key.startswith("$"))
-    except (ImportError, OSError, KeyError, ValueError, TypeError, ModuleNotFoundError):
-        return []
+        import requests
+        response = requests.get("https://data.sherlockproject.xyz", timeout=8)
+        response.raise_for_status()
+        live = response.json()
+        loaded = {k: v for k, v in live.items() if not k.startswith("$") and isinstance(v, dict)}
+        if len(loaded) >= 100:
+            entries, source = loaded, "official live catalog"
+    except Exception:
+        pass
+    exclusions = set()
+    try:
+        import requests
+        response = requests.get("https://raw.githubusercontent.com/sherlock-project/sherlock/refs/heads/exclusions/false_positive_exclusions.txt", timeout=5)
+        response.raise_for_status()
+        exclusions = {v.strip() for v in response.text.splitlines() if v.strip() and not v.startswith("#")}
+    except Exception:
+        pass
+    result = {"entries": entries, "exclusions": exclusions, "source": source, "fetched_at": now}
+    with CATALOG_LOCK:
+        CATALOG_CACHE.clear()
+        CATALOG_CACHE.update(result)
+        return CATALOG_CACHE
+
+
+def discover_sites(nsfw: bool = False, ignore_exclusions: bool = False) -> list[str]:
+    data = get_catalog()
+    return sorted((name for name, meta in data["entries"].items()
+                   if (ignore_exclusions or name not in data["exclusions"])
+                   and (nsfw or not meta.get("isNSFW", False))), key=str.casefold)
 
 
 async def require_auth(x_sherlock_token: str | None = Header(default=None)) -> None:
@@ -91,7 +128,7 @@ async def require_auth(x_sherlock_token: str | None = Header(default=None)) -> N
 
 class ScanRequest(BaseModel):
     usernames: list[str] = Field(min_length=1, max_length=8)
-    sites: list[str] = Field(default_factory=list, max_length=30)
+    sites: list[str] = Field(default_factory=list, max_length=600)
     timeout: int = Field(default=30, ge=5, le=120)
     nsfw: bool = False
     local: bool = False
@@ -282,19 +319,30 @@ def js():
 
 @app.get("/api/meta")
 def meta():
-    sites = discover_sites()
-    command = engine_command()
-    return {
-        "engine_ready": bool(command), "engine_version": engine_version(),
-        "site_count": len(sites) if sites else None,
-        "auth_required": bool(AUTH_TOKEN),
-        "max_usernames": 8, "max_active": MAX_ACTIVE,
-    }
+    try:
+        default_count = len(discover_sites())
+        all_count = len(discover_sites(nsfw=True, ignore_exclusions=True))
+        data = get_catalog()
+        catalog = {"site_count": default_count, "catalog_count": all_count,
+                   "nsfw_count": sum(bool(v.get("isNSFW")) for v in data["entries"].values()),
+                   "excluded_count": sum(v in data["entries"] for v in data["exclusions"]),
+                   "catalog_source": data["source"]}
+    except Exception:
+        catalog = {"site_count": None, "catalog_count": None, "catalog_source": "unavailable"}
+    return {"engine_ready": bool(engine_command()), "engine_version": engine_version(),
+            "auth_required": bool(AUTH_TOKEN), "max_usernames": 8, "max_active": MAX_ACTIVE, **catalog}
 
 
 @app.get("/api/sites", dependencies=[Depends(require_auth)])
 def sites():
-    return {"sites": discover_sites()}
+    data = get_catalog()
+    all_sites = discover_sites(nsfw=True, ignore_exclusions=True)
+    return {"sites": all_sites,
+            "default_count": len(discover_sites()),
+            "catalog_count": len(all_sites),
+            "excluded": sorted(data["exclusions"].intersection(data["entries"])),
+            "nsfw": sorted(name for name, val in data["entries"].items() if val.get("isNSFW")),
+            "source": data["source"]}
 
 
 @app.post("/api/scans", status_code=202, dependencies=[Depends(require_auth)])
