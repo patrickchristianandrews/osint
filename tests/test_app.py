@@ -155,6 +155,7 @@ class SherlockWebTests(unittest.TestCase):
         self.assertEqual(job.snapshot()['summary']['unknown'], 1)
         self.assertEqual(app.normalize_status('Illegal'), 'illegal')
         self.assertEqual(app.normalize_status('WAF'), 'waf')
+        self.assertEqual(app.ScanRequest(usernames=['demo'], sites=['osu!']).sites, ['osu!'])
 
     def test_export_unknown_scan(self):
         self.assertEqual(self.client.get('/api/scans/nope/export/json').status_code, 404)
