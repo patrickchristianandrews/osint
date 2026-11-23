@@ -170,21 +170,25 @@ class ScanJob:
     process: subprocess.Popen | None = None
     cancelled: bool = False
     events_seen: int = 0
+    current_username: str = ""
+    target_sites: int | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def snapshot(self) -> dict:
         with self.lock:
             found = sum(row["status"] == "found" for row in self.results)
             not_found = sum(row["status"] == "not_found" for row in self.results)
-            unknown = sum(row["status"] == "unknown" for row in self.results)
+            unknown = sum(row["status"] not in {"found", "not_found"} for row in self.results)
             return {
                 "id": self.id, "status": self.status,
                 "usernames": self.request.usernames, "sites": self.request.sites,
                 "created_at": self.created_at, "started_at": self.started_at,
                 "finished_at": self.finished_at, "error": self.error,
                 "log": list(self.log), "results": list(self.results), "events_seen": self.events_seen,
+                "current_username": self.current_username,
                 "summary": {"found": found, "not_found": not_found,
-                            "unknown": unknown, "checked": len(self.results)},
+                            "unknown": unknown, "checked": len(self.results),
+                            "target_sites": self.target_sites},
             }
 
 
@@ -194,6 +198,10 @@ def normalize_status(raw: str) -> str:
         return "found"
     if raw in {"available", "not_found", "not found", "false", "querystatus.available"}:
         return "not_found"
+    if raw in {"waf", "querystatus.waf"}:
+        return "waf"
+    if raw in {"illegal", "querystatus.illegal"}:
+        return "illegal"
     return "unknown"
 
 
@@ -219,6 +227,39 @@ def parse_csv_results(folder: Path) -> list[dict]:
     return rows
 
 
+def record_cli_event(job: ScanJob, line: str) -> None:
+    """Record partial Sherlock results even before its CSV files exist."""
+    started = re.match(r"^\[\*\] Checking username (.+?) on:", line)
+    if started:
+        with job.lock:
+            job.current_username = started.group(1)
+        return
+    event = re.match(r"^\[([+-])\](?: \[\d+ms\])? (.+?): (.*)$", line)
+    if not event:
+        return
+    symbol, site, detail = event.groups()
+    with job.lock:
+        username = job.current_username
+    if not site or not username:
+        return
+    status = ("found" if symbol == "+" else
+              "not_found" if detail.startswith("Not Found!") else
+              "waf" if "Blocked by bot detection" in detail else
+              "illegal" if "Illegal Username Format" in detail else "unknown")
+    row = {"username": username, "site": site, "url": detail if status == "found" else "",
+           "homepage": "", "status": status,
+           "raw_status": {"found": "Claimed", "not_found": "Available", "waf": "WAF", "illegal": "Illegal", "unknown": "Unknown"}[status],
+           "http_status": "", "response_time": "", "reason": detail}
+    with job.lock:
+        index = next((i for i, value in enumerate(job.results)
+                      if (value["username"], value["site"]) == (username, site)), None)
+        if index is not None:
+            job.results[index] = row
+        else:
+            job.results.append(row)
+        job.events_seen += 1
+
+
 def run_scan(job: ScanJob) -> None:
     with job.lock:
         if job.cancelled:
@@ -236,6 +277,10 @@ def run_scan(job: ScanJob) -> None:
             job.error = "The Sherlock engine is missing. Install dependencies with: pip install -r requirements.txt"
             job.finished_at = utc_now()
         return
+    try:
+        job.target_sites = len(job.request.sites) if job.request.sites else len(discover_sites(nsfw=job.request.nsfw, ignore_exclusions=job.request.ignore_exclusions))
+    except Exception:
+        job.target_sites = None
     job.folder.mkdir(parents=True, exist_ok=True)
     cmd = prefix + ["--no-color", "--print-all", "--csv", "--xlsx", "--txt",
                     "--folderoutput", str(job.folder), "--timeout", str(job.request.timeout)]
@@ -266,11 +311,15 @@ def run_scan(job: ScanJob) -> None:
                 if value:
                     with job.lock:
                         job.log.append(value[:600])
-                        if value.startswith(("[+]", "[-]", "[!]")):
-                            job.events_seen += 1
+                    record_cli_event(job, value)
         code = proc.wait()
         with job.lock:
-            job.results = parse_csv_results(job.folder)
+            final_rows = parse_csv_results(job.folder)
+            if final_rows:
+                reasons = {(r["username"], r["site"]): r.get("reason", "") for r in job.results}
+                for row in final_rows:
+                    row["reason"] = reasons.get((row["username"], row["site"]), "")
+                job.results = final_rows
             if job.cancelled:
                 job.status = "cancelled"
                 job.error = "Scan stopped by user."
