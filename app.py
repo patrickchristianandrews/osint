@@ -470,7 +470,7 @@ def export_scan(job_id: str, format: Literal["json", "csv", "txt", "xlsx"]):
         writer = csv.DictWriter(output, fieldnames=["username", "site", "url", "homepage", "status", "raw_status", "http_status", "response_time"])
         writer.writeheader()
         for item in data:
-            writer.writerow({key: safe_cell(str(value)) for key, value in item.items()})
+            writer.writerow({key: safe_cell(str(item.get(key, ""))) for key in writer.fieldnames})
         return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
     if format == "txt":
         output = "\n".join(f'{item["username"]} | {item["site"]} | {item["url"]}' for item in data if item["status"] == "found")
