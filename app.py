@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -34,6 +35,19 @@ MAX_JOBS = 50
 AUTH_TOKEN = os.environ.get("SHERLOCK_WEB_TOKEN", "")
 
 app = FastAPI(title="Sherlock Web", description="Web interface for the official Sherlock OSINT engine", version="1.0.0")
+# Permit the public Random Candy Land frontend to access the separately hosted API.
+# Override SHERLOCK_WEB_CORS_ORIGINS if deploying with another trusted origin.
+CORS_ORIGINS = [origin.strip() for origin in os.environ.get(
+    "SHERLOCK_WEB_CORS_ORIGINS",
+    "https://randomcandyland.com,https://www.randomcandyland.com",
+).split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "X-Sherlock-Token"],
+)
 JOBS: dict[str, "ScanJob"] = {}
 JOBS_LOCK = threading.RLock()
 
